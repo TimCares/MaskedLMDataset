@@ -12,7 +12,7 @@ from typing import Union, Tuple, Dict, Any, List
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from .base_datasets import BaseDataset
 from .mixins import TextMixin
-from multiprocessing import shared_memory
+from .utils import SharedMemoryArray
 
 def init_worker(tokenizer_path:os.PathLike) -> None:
     """Initialize the tokenizer in the worker process. Each worker process will have its own tokenizer instance.
@@ -44,6 +44,7 @@ class MaskedLMDataset(TextMixin, BaseDataset):
         text_file:os.PathLike,
         tokenizer:Union[PreTrainedTokenizer, PreTrainedTokenizerFast]=None,
         mask_prob:float=0.0,
+        whole_word_mask:bool=True,
         block_size:int=512,
     ):
         """A universal dataset for raw unstructured text data that supports masked language modeling.
@@ -58,6 +59,7 @@ class MaskedLMDataset(TextMixin, BaseDataset):
                 If None, then the BERT base uncased tokenizer will be used by default:
                 BertTokenizer.from_pretrained("bert-base-uncased").
             mask_prob (float, optional): The probability of masking a token in the text data. Defaults to 0.0, so no masking is done.
+            whole_word_mask (bool, optional): Whether to mask entire words. Defaults to True.
             block_size (int, optional): How many tokens should be in one block. One block is equal to one training example, i.e.
                 a single text sequence. This is the maximum sequence length. The text file will be sliced into chunks
                 of <block_size> tokens. Defaults to 512.
@@ -73,6 +75,7 @@ class MaskedLMDataset(TextMixin, BaseDataset):
             mlm_probability=mask_prob,
         )
         self.text_file = text_file
+        self.whole_word_mask = whole_word_mask
         # Subtract 2 for CLS and SEP tokens -> each slice of the text data will be block_size-2 tokens long
         # if we then add 2 tokens for CLS and SEP tokens, the total length will be block_size
         self.block_size = block_size - 2
@@ -111,6 +114,10 @@ class MaskedLMDataset(TextMixin, BaseDataset):
         self.mmap_file = mmap.mmap(self.fp.fileno(), 0, access=mmap.ACCESS_READ)
 
     def load(self) -> None:
+        """
+        Load the data of the current split from the index files into memory. After calling this method, the
+        dataset is ready to be used.
+        """        
         self.build_sequences()
 
     def preprocess(self) -> None:
@@ -280,7 +287,7 @@ class MaskedLMDataset(TextMixin, BaseDataset):
         # sequence length is in number of tokens, each token is 4 bytes (length * 4 = length in bytes)
         tokens = np.frombuffer(self.mmap_file[offset:offset + length * 4], dtype=np.int32).tolist()
 
-        text_dict = self.get_text(tokens)
+        text_dict = self.get_text(tokens, whole_word_mask=self.whole_word_mask)
         result_dict.update(text_dict)
         result_dict["id"] = idx
 
@@ -304,49 +311,3 @@ class MaskedLMDataset(TextMixin, BaseDataset):
         batch_tensors = super().collater(samples)
         batch_tensors = self.apply_mask(batch_tensors)
         return batch_tensors
-
-class SharedMemoryArray:
-    """
-    Wrapper around NumPy arrays using multiprocessing.shared_memory for shared memory.
-    See: https://docs.python.org/3/library/multiprocessing.shared_memory.html
-    """
-
-    def __init__(self, array:np.ndarray):
-        self.shape = array.shape
-        self.dtype = array.dtype
-        self.shm = shared_memory.SharedMemory(create=True, size=array.nbytes)
-        self.array = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm.buf)
-        self.array[:] = array[:]
-
-    def __getstate__(self) -> Tuple[Tuple[int, ...], np.dtype, str]:
-        """Prepare the object's state for pickling. Useful for multiprocessing when
-        we do not want to copy the entire object to each worker process.
-
-        Returns:
-            Tuple[Tuple[int, ...], np.dtype, str]: A tuple containing the shape of the array (tuple[0]),
-                the dtype (tuple[1]) of the array, and the name of the shared memory block (tuple[2]).
-        """
-        return (self.shape, self.dtype, self.shm.name)
-
-    def __setstate__(self, state:Tuple[Tuple[int, ...], np.dtype, str]) -> None:
-        """Restore the object's state from the unpickled state. This is executed in every worker process
-        when using multiprocessing.
-
-        Args:
-            state (Tuple[Tuple[int, ...], np.dtype, str]): The state of the object to be restored.
-                A tuple containing the shape of the array (tuple[0]), the dtype (tuple[1]) of the array,
-                and the name of the shared memory block (tuple[2]).
-        """
-        self.shape, self.dtype, shm_name = state
-        # get shared memory by name
-        self.shm = shared_memory.SharedMemory(name=shm_name)
-        # create array from shared memory, this is the reconstructed array
-        self.array = np.ndarray(self.shape, dtype=self.dtype, buffer=self.shm.buf)
-
-    def __del__(self) -> None:
-        """Clean up shared memory resources."""
-        try:
-            self.shm.close()
-            self.shm.unlink()
-        except FileNotFoundError:
-            pass  # The shared memory block might have been already unlinked.
