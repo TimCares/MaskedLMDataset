@@ -13,8 +13,8 @@ def check_int_str_list_type(l: List[Any]) -> Any:
         l (List[Any]): The list to check.
 
     Returns:
-        Any: The type of the elements in the list, either int, str. If the list contains elements of both types,
-            or all elements or of another type (e.g. float), returns Any.
+        Any: The type of the elements in the list, either int, str. If the list contains elements of both/multiple types,
+            or all elements are of another type (e.g. float), returns Any.
     """        
     if all(isinstance(item, int) for item in l):
         return int
